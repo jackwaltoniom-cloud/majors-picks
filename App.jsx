@@ -163,10 +163,14 @@ const computeStanding = (entry, field) => {
 const sortStandings = (s) => [...s].sort((a, b) => {
   if (a.eliminated !== b.eliminated) return a.eliminated ? 1 : -1;
   if (a.total !== b.total) return a.total - b.total;
+  // Tiebreaker 1: highest combined odds wins (rewards taking longshots).
+  if (a.combinedOdds !== b.combinedOdds) return b.combinedOdds - a.combinedOdds;
+  // Tiebreaker 2: lowest Sunday score.
   const aS = a.sundayScore ?? Infinity;
   const bS = b.sundayScore ?? Infinity;
   if (aS !== bS) return aS - bS;
-  return (a.saturdayScore ?? Infinity) - (b.saturdayScore ?? Infinity);
+  // If still tied — entrants share the prize. Display in alphabetical order.
+  return a.entry.name.localeCompare(b.entry.name);
 });
 
 const formatToPar = (n) => {
@@ -411,7 +415,7 @@ function PicksView({ config, field, entries, onSubmit, onUpdate }) {
         <p style={styles.emptyText}>
           The tournament is underway. Head to the Leaderboard to see how everyone's doing.
         </p>
-        <SubmittedList entries={entries} field={field} />
+        <SubmittedList entries={entries} field={field} showPicks={true} />
       </div>
     );
   }
@@ -535,7 +539,7 @@ const ParlayCard = ({ parlay, valid, hasAll }) => (
   </div>
 );
 
-function SubmittedList({ entries, field, onEdit, editingId }) {
+function SubmittedList({ entries, field, onEdit, editingId, showPicks = false }) {
   if (!entries.length) return null;
   return (
     <div style={{ ...styles.panelSection, marginTop: 32 }}>
@@ -550,12 +554,14 @@ function SubmittedList({ entries, field, onEdit, editingId }) {
           }}>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={styles.entryName}>{e.name}</div>
-              <div style={styles.entryPicks}>
-                {e.picks.map(pid => {
-                  const p = field.find(x => x.id === pid);
-                  return p ? p.name.split(' ').slice(-1)[0] : '?';
-                }).join(' · ')}
-              </div>
+              {showPicks && (
+                <div style={styles.entryPicks}>
+                  {e.picks.map(pid => {
+                    const p = field.find(x => x.id === pid);
+                    return p ? p.name.split(' ').slice(-1)[0] : '?';
+                  }).join(' · ')}
+                </div>
+              )}
             </div>
             {onEdit && (
               <button onClick={() => onEdit(e)} style={styles.editBtn} title="Edit this entry">
@@ -565,7 +571,12 @@ function SubmittedList({ entries, field, onEdit, editingId }) {
           </div>
         ))}
       </div>
-      {onEdit && (
+      {!showPicks && (
+        <div style={{ ...styles.helpText, marginTop: 10 }}>
+          Picks stay hidden until the tournament locks. {onEdit && 'Tap the pencil on your own entry to edit it before then.'}
+        </div>
+      )}
+      {showPicks && onEdit && (
         <div style={{ ...styles.helpText, marginTop: 10 }}>
           Tap the pencil to edit any entry up until lock-in.
         </div>
@@ -755,6 +766,7 @@ function AdminPanel({ config, field, entries, saveConfig, saveField, saveEntries
     { id: 'setup', label: 'Setup' },
     { id: 'field', label: 'Field & Status' },
     { id: 'scores', label: 'Scores' },
+    { id: 'paste', label: 'Paste Scores' },
     { id: 'entries', label: 'Entries' },
     { id: 'danger', label: 'Reset' }
   ];
@@ -782,6 +794,7 @@ function AdminPanel({ config, field, entries, saveConfig, saveField, saveEntries
         {section === 'setup' && <SetupSection config={config} saveConfig={saveConfig} field={field} />}
         {section === 'field' && <FieldSection field={field} saveField={saveField} />}
         {section === 'scores' && <ScoresSection field={field} saveField={saveField} />}
+        {section === 'paste' && <PasteScoresSection field={field} saveField={saveField} />}
         {section === 'entries' && <EntriesSection entries={entries} field={field} saveEntries={saveEntries} />}
         {section === 'danger' && <DangerSection saveConfig={saveConfig} saveField={saveField} saveEntries={saveEntries} />}
       </div>
@@ -1046,6 +1059,210 @@ function ScoreInput({ value, onChange }) {
       onBlur={handleBlur}
       style={styles.scoreInput}
     />
+  );
+}
+
+// --- Paste scores ---
+// Lets admin paste a leaderboard (e.g. from BBC Sport or PGA Tour) and
+// extract player names + to-par scores in bulk for a single round.
+//
+// Parser handles lines like:
+//   "1   Scottie Scheffler   -3"
+//   "T3  Rory McIlroy        +2"
+//   "Tom Kim  E"
+//   "Bryson DeChambeau -4"
+// — i.e. optional leading position (1, T3, etc.), then a name, then a
+// trailing to-par score (-N, +N, plain N, or "E"/"e" for even).
+const parseLeaderboardText = (text) => {
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const out = [];
+  for (const line of lines) {
+    // Strip a leading position marker if present (e.g. "1 ", "T3 ", "12. ")
+    const stripped = line.replace(/^T?\d+[\s.):-]+\s*/, '');
+    // Match: <name> <score> at the end of the line
+    let m = stripped.match(/^(.+?)\s+(E|e)$/);
+    if (m) { out.push({ rawName: m[1].trim(), score: 0 }); continue; }
+    m = stripped.match(/^(.+?)\s+([+-]?\d+)$/);
+    if (m) {
+      const n = parseInt(m[2], 10);
+      if (Number.isFinite(n)) {
+        out.push({ rawName: m[1].trim(), score: n });
+        continue;
+      }
+    }
+    // Couldn't parse — skip silently
+  }
+  return out;
+};
+
+// Match parsed names against the field. Returns the same array enriched
+// with { playerId, matchType, matchedName } or { matchType: 'unmatched' }.
+const matchToField = (parsed, field) => {
+  return parsed.map(p => {
+    const raw = p.rawName.toLowerCase().trim();
+    // Exact full-name match
+    let hit = field.find(f => f.name.toLowerCase() === raw);
+    if (hit) return { ...p, playerId: hit.id, matchType: 'exact', matchedName: hit.name };
+    // Last-name match (handles "Scheffler" vs "Scottie Scheffler")
+    const rawLast = raw.split(/\s+/).pop();
+    const lastMatches = field.filter(f => f.name.toLowerCase().split(/\s+/).pop() === rawLast);
+    if (lastMatches.length === 1) {
+      return { ...p, playerId: lastMatches[0].id, matchType: 'lastname', matchedName: lastMatches[0].name };
+    }
+    if (lastMatches.length > 1) {
+      return { ...p, matchType: 'ambiguous', candidates: lastMatches.map(c => c.name) };
+    }
+    // Substring fallback (handles "R. McIlroy" vs "Rory McIlroy" if the
+    // last name is unique in the field after split — already covered above —
+    // but also catches things like "DeChambeau, Bryson")
+    const fuzzy = field.filter(f => {
+      const fn = f.name.toLowerCase();
+      return fn.includes(raw) || raw.includes(fn);
+    });
+    if (fuzzy.length === 1) {
+      return { ...p, playerId: fuzzy[0].id, matchType: 'fuzzy', matchedName: fuzzy[0].name };
+    }
+    return { ...p, matchType: 'unmatched' };
+  });
+};
+
+function PasteScoresSection({ field, saveField }) {
+  const [round, setRound] = useState('r1');
+  const [raw, setRaw] = useState('');
+  const [preview, setPreview] = useState(null);
+  const [applied, setApplied] = useState(false);
+
+  if (!field.length) {
+    return <div style={styles.helpText}>No field set up yet — head to Setup first.</div>;
+  }
+
+  const handleParse = () => {
+    const parsed = parseLeaderboardText(raw);
+    const matched = matchToField(parsed, field);
+    setPreview(matched);
+    setApplied(false);
+  };
+
+  const handleApply = async () => {
+    if (!preview) return;
+    const updates = preview.filter(p => p.playerId);
+    if (!updates.length) return;
+    const next = field.map(p => {
+      const update = updates.find(u => u.playerId === p.id);
+      if (!update) return p;
+      const scores = { ...p.scores, [round]: update.score };
+      return { ...p, scores };
+    });
+    await saveField(next);
+    setApplied(true);
+    setPreview(null);
+    setRaw('');
+  };
+
+  const matchCount = preview ? preview.filter(p => p.playerId).length : 0;
+  const skipCount = preview ? preview.length - matchCount : 0;
+
+  return (
+    <div>
+      <h3 style={styles.h3}>Paste a leaderboard</h3>
+      <p style={styles.helpText}>
+        After a round finishes, copy the leaderboard text from BBC Sport or the PGA Tour site and paste it below. The app extracts player names and their to-par score for the round you select, then shows you a preview before applying. Pre-existing scores in that round for matched players will be overwritten.
+      </p>
+
+      <label style={{ ...styles.label, marginTop: 18 }}>Round being updated</label>
+      <div style={{ display: 'flex', gap: 6, marginBottom: 14 }}>
+        {[['r1','R1'],['r2','R2'],['r3','R3'],['r4','R4']].map(([id, l]) => (
+          <button
+            key={id}
+            onClick={() => setRound(id)}
+            style={{
+              ...styles.statusBtn,
+              ...(round === id ? styles.statusBtnActive : {}),
+              padding: '8px 14px', fontSize: 13
+            }}
+          >{l}</button>
+        ))}
+      </div>
+
+      <label style={styles.label}>Pasted leaderboard text</label>
+      <textarea
+        value={raw}
+        onChange={e => setRaw(e.target.value)}
+        placeholder={'1   Scottie Scheffler   -3\nT2  Rory McIlroy        -2\nT2  Xander Schauffele   -2\n4   Bryson DeChambeau   -1\n…'}
+        style={{ ...styles.input, height: 220, fontFamily: '"JetBrains Mono", monospace', fontSize: 13 }}
+      />
+      <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+        <button onClick={handleParse} disabled={!raw.trim()} style={{
+          ...styles.secondaryBtn,
+          ...(raw.trim() ? {} : { opacity: 0.5, cursor: 'not-allowed' })
+        }}>
+          Parse
+        </button>
+        {preview && matchCount > 0 && !applied && (
+          <button onClick={handleApply} style={styles.cta}>
+            Apply {matchCount} {matchCount === 1 ? 'score' : 'scores'} to {round.toUpperCase()} <ArrowRight size={16} />
+          </button>
+        )}
+      </div>
+
+      {applied && (
+        <div style={{ ...styles.infoBox, marginTop: 14 }}>
+          <Check size={14} style={{ verticalAlign: 'middle' }} /> Scores applied. Head to the Leaderboard tab to check the standings.
+        </div>
+      )}
+
+      {preview && preview.length === 0 && (
+        <div style={{ ...styles.errorBox, marginTop: 14 }}>
+          <AlertTriangle size={14} /> Couldn't parse any lines. Each line needs a name and a score (like <code>Scottie Scheffler -3</code>).
+        </div>
+      )}
+
+      {preview && preview.length > 0 && (
+        <div style={{ marginTop: 18 }}>
+          <div style={styles.subhead}>
+            Preview · <strong>{matchCount}</strong> matched · <strong>{skipCount}</strong> skipped
+          </div>
+          <div style={{ maxHeight: 360, overflowY: 'auto', border: '1px solid rgba(0,0,0,0.08)', borderRadius: 6 }}>
+            {preview.map((p, i) => (
+              <div key={i} style={styles.previewMatchRow}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 500 }}>
+                    {p.matchedName || p.rawName}
+                  </div>
+                  {p.matchType !== 'exact' && p.matchType !== 'unmatched' && p.matchType !== 'ambiguous' && (
+                    <div style={{ fontSize: 11, color: 'rgba(26,31,46,0.55)' }}>
+                      pasted as "{p.rawName}"
+                    </div>
+                  )}
+                  {p.matchType === 'unmatched' && (
+                    <div style={{ fontSize: 11, color: '#A23E2E' }}>
+                      no player found — will be skipped
+                    </div>
+                  )}
+                  {p.matchType === 'ambiguous' && (
+                    <div style={{ fontSize: 11, color: '#A23E2E' }}>
+                      multiple matches ({p.candidates.join(', ')}) — will be skipped
+                    </div>
+                  )}
+                </div>
+                <div style={{
+                  fontFamily: '"JetBrains Mono", monospace', fontSize: 13, fontWeight: 600,
+                  color: p.playerId ? '#2D4A35' : 'rgba(26,31,46,0.35)',
+                  minWidth: 50, textAlign: 'right'
+                }}>
+                  {p.score === 0 ? 'E' : (p.score > 0 ? `+${p.score}` : p.score)}
+                </div>
+              </div>
+            ))}
+          </div>
+          {skipCount > 0 && (
+            <div style={{ ...styles.helpText, marginTop: 8 }}>
+              Skipped entries won't be applied. Use the manual Scores tab to handle them.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1509,6 +1726,12 @@ const styles = {
     display: 'flex', justifyContent: 'space-between',
     padding: '4px 8px', fontSize: 12,
     borderBottom: '1px dashed rgba(0,0,0,0.06)'
+  },
+  previewMatchRow: {
+    display: 'flex', alignItems: 'center', gap: 10,
+    padding: '10px 14px',
+    borderBottom: '1px solid rgba(0,0,0,0.05)',
+    background: 'rgba(255,255,255,0.6)'
   },
 
   // Entries admin
